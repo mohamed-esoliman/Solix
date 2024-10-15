@@ -1,0 +1,361 @@
+#!/bin/bash
+#
+# Solix Init System (rcS)
+# Part of the Solix custom Linux build
+#
+# Copyright (c) 2024 Mohamed Soliman
+# Licensed under the MIT License
+#
+# This is the main initialization script that runs as PID 1
+# after the kernel boots. It sets up the basic system environment
+# and launches the Solix shell.
+#
+
+# Solix banner
+echo "
+███████╗ ██████╗ ██╗     ██╗██╗  ██╗
+██╔════╝██╔═══██╗██║     ██║╚██╗██╔╝
+███████╗██║   ██║██║     ██║ ╚███╔╝ 
+╚════██║██║   ██║██║     ██║ ██╔██╗ 
+███████║╚██████╔╝███████╗██║██╔╝ ██╗
+╚══════╝ ╚═════╝ ╚══════╝╚═╝╚═╝  ╚═╝
+
+Solix Custom Linux System
+Version 1.0 - Handcrafted from scratch
+"
+
+# Logging setup
+LOG_FILE="/var/log/boot.log"
+mkdir -p /var/log
+exec 1> >(tee -a $LOG_FILE)
+exec 2> >(tee -a $LOG_FILE >&2)
+
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $1" | tee -a $LOG_FILE
+}
+
+log_success() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] $1" | tee -a $LOG_FILE
+}
+
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" | tee -a $LOG_FILE
+}
+
+log_warning() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] $1" | tee -a $LOG_FILE
+}
+
+# Start of init process
+log_info "===== Solix Init System Starting ====="
+log_info "PID: $$"
+log_info "Init script: $0"
+log_info "Boot time: $(date)"
+
+# Function to mount virtual filesystems
+mount_virtual_filesystems() {
+    log_info "Mounting virtual filesystems..."
+    
+    # Mount /proc filesystem
+    if ! mountpoint -q /proc; then
+        mount -t proc proc /proc && log_success "/proc mounted" || log_error "Failed to mount /proc"
+    else
+        log_info "/proc already mounted"
+    fi
+    
+    # Mount /sys filesystem
+    if ! mountpoint -q /sys; then
+        mount -t sysfs sysfs /sys && log_success "/sys mounted" || log_error "Failed to mount /sys"
+    else
+        log_info "/sys already mounted"
+    fi
+    
+    # Mount /dev filesystem with devtmpfs
+    if ! mountpoint -q /dev; then
+        mount -t devtmpfs devtmpfs /dev && log_success "/dev mounted" || log_error "Failed to mount /dev"
+    else
+        log_info "/dev already mounted"
+    fi
+    
+    # Mount /tmp as tmpfs
+    if ! mountpoint -q /tmp; then
+        mount -t tmpfs tmpfs /tmp -o size=64M && log_success "/tmp mounted (64MB tmpfs)" || log_warning "Failed to mount /tmp"
+    else
+        log_info "/tmp already mounted"
+    fi
+    
+    # Create additional device nodes if needed
+    [ ! -c /dev/null ] && mknod /dev/null c 1 3
+    [ ! -c /dev/zero ] && mknod /dev/zero c 1 5
+    [ ! -c /dev/random ] && mknod /dev/random c 1 8
+    [ ! -c /dev/urandom ] && mknod /dev/urandom c 1 9
+    [ ! -c /dev/tty ] && mknod /dev/tty c 5 0
+    [ ! -c /dev/console ] && mknod /dev/console c 5 1
+    
+    log_success "Virtual filesystems setup completed"
+}
+
+# Function to set up system environment
+setup_environment() {
+    log_info "Setting up system environment..."
+    
+    # Set hostname
+    echo "solix" > /etc/hostname
+    hostname solix
+    log_success "Hostname set to: $(hostname)"
+    
+    # Set up /etc/hosts
+    cat > /etc/hosts << 'EOF'
+127.0.0.1   localhost solix
+::1         localhost solix
+EOF
+    log_success "/etc/hosts configured"
+    
+    # Set up basic environment variables
+    export PATH="/bin:/sbin:/usr/bin:/usr/sbin"
+    export HOME="/root"
+    export USER="root"
+    export SHELL="/bin/shell"
+    export TERM="linux"
+    export LANG="C"
+    
+    # Create passwd file for basic user info
+    cat > /etc/passwd << 'EOF'
+root:x:0:0:root:/root:/bin/shell
+EOF
+    
+    # Create group file
+    cat > /etc/group << 'EOF'
+root:x:0:
+EOF
+    
+    log_success "Basic user environment configured"
+    
+    # Set up motd (message of the day)
+    cat > /etc/motd << 'EOF'
+Welcome to Solix!
+
+This is a custom Linux system built from scratch.
+Type 'help' for available commands.
+
+Solix = Soliman + Linux
+Built with ♥ and way too much coffee.
+EOF
+    
+    log_success "System environment setup completed"
+}
+
+# Function to configure network (basic)
+setup_network() {
+    log_info "Setting up basic networking..."
+    
+    # Bring up loopback interface
+    if command -v ip >/dev/null 2>&1; then
+        ip link set lo up && log_success "Loopback interface activated"
+    elif command -v ifconfig >/dev/null 2>&1; then
+        ifconfig lo up && log_success "Loopback interface activated"
+    else
+        log_warning "No network tools found, skipping network setup"
+        return
+    fi
+    
+    # Try to configure eth0 with DHCP if available
+    if [ -e /sys/class/net/eth0 ]; then
+        log_info "Ethernet interface eth0 detected"
+        if command -v dhclient >/dev/null 2>&1; then
+            dhclient eth0 &
+            log_info "DHCP client started for eth0"
+        elif command -v udhcpc >/dev/null 2>&1; then
+            udhcpc -i eth0 &
+            log_info "udhcpc started for eth0"
+        else
+            log_warning "No DHCP client found"
+        fi
+    else
+        log_info "No ethernet interface found"
+    fi
+    
+    log_success "Network setup completed"
+}
+
+# Function to start system services
+start_services() {
+    log_info "Starting system services..."
+    
+    # Start kernel log daemon if available
+    if command -v klogd >/dev/null 2>&1; then
+        klogd && log_success "Kernel log daemon started"
+    fi
+    
+    # Start system log daemon if available
+    if command -v syslogd >/dev/null 2>&1; then
+        syslogd && log_success "System log daemon started"
+    fi
+    
+    log_success "System services startup completed"
+}
+
+# Function to perform system checks
+system_checks() {
+    log_info "Performing system checks..."
+    
+    # Check available memory
+    if [ -r /proc/meminfo ]; then
+        TOTAL_MEM=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+        FREE_MEM=$(grep MemFree /proc/meminfo | awk '{print $2}')
+        log_info "Memory: ${TOTAL_MEM}KB total, ${FREE_MEM}KB free"
+    fi
+    
+    # Check CPU information
+    if [ -r /proc/cpuinfo ]; then
+        CPU_COUNT=$(grep -c processor /proc/cpuinfo)
+        CPU_MODEL=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | sed 's/^ *//')
+        log_info "CPU: $CPU_COUNT core(s) - $CPU_MODEL"
+    fi
+    
+    # Check root filesystem
+    ROOT_FS=$(mount | grep " / " | awk '{print $5}')
+    log_info "Root filesystem: $ROOT_FS"
+    
+    # Check available disk space
+    if command -v df >/dev/null 2>&1; then
+        ROOT_USAGE=$(df / | tail -1 | awk '{print $5}')
+        log_info "Root filesystem usage: $ROOT_USAGE"
+    fi
+    
+    log_success "System checks completed"
+}
+
+# Function to create runtime directories
+create_runtime_dirs() {
+    log_info "Creating runtime directories..."
+    
+    # Standard runtime directories
+    mkdir -p /var/run /var/lock /var/tmp
+    chmod 1777 /var/tmp
+    
+    # User directories
+    mkdir -p /home
+    
+    # Log directories
+    mkdir -p /var/log
+    
+    log_success "Runtime directories created"
+}
+
+# Function to display system information
+display_system_info() {
+    echo
+    echo "======================================"
+    echo "         Solix System Information"
+    echo "======================================"
+    echo "Hostname: $(hostname)"
+    echo "Kernel: $(uname -r)"
+    echo "Architecture: $(uname -m)"
+    echo "Uptime: $(uptime | cut -d, -f1)"
+    if [ -r /proc/meminfo ]; then
+        echo "Memory: $(grep MemTotal /proc/meminfo | awk '{print $2}') KB"
+    fi
+    echo "Init System: Solix custom init"
+    echo "Shell: /bin/shell (custom)"
+    echo "======================================"
+    echo
+}
+
+# Function to handle system shutdown
+cleanup_and_shutdown() {
+    log_info "Received shutdown signal, cleaning up..."
+    
+    # Terminate child processes
+    log_info "Terminating child processes..."
+    
+    # Unmount filesystems
+    log_info "Unmounting filesystems..."
+    umount /tmp 2>/dev/null || true
+    
+    log_info "Solix shutdown complete"
+    exit 0
+}
+
+# Set up signal handlers
+trap cleanup_and_shutdown TERM INT
+
+# Main initialization sequence
+main() {
+    log_info "Starting main initialization sequence..."
+    
+    # Core system setup
+    mount_virtual_filesystems
+    create_runtime_dirs
+    setup_environment
+    
+    # Optional components
+    setup_network
+    start_services
+    system_checks
+    
+    # Display welcome information
+    display_system_info
+    
+    # Show message of the day
+    if [ -f /etc/motd ]; then
+        cat /etc/motd
+    fi
+    
+    log_success "Solix initialization completed successfully!"
+    log_info "===== Init process complete, starting shell ====="
+    
+    # Start the main shell
+    if [ -x /bin/shell ]; then
+        log_info "Starting Solix custom shell"
+        exec /bin/shell
+    elif [ -x /bin/bash ]; then
+        log_warning "Custom shell not found, falling back to bash"
+        exec /bin/bash
+    elif [ -x /bin/sh ]; then
+        log_warning "Custom shell not found, falling back to sh"
+        exec /bin/sh
+    else
+        log_error "No shell found! Starting emergency console"
+        echo "ERROR: No shell available!"
+        echo "Available commands:"
+        ls /bin/ 2>/dev/null || echo "No /bin directory found"
+        
+        # Emergency mini-shell
+        while true; do
+            echo -n "emergency> "
+            read cmd
+            case "$cmd" in
+                "help")
+                    echo "Emergency commands: help, ls, exit, reboot"
+                    ;;
+                "ls")
+                    ls /
+                    ;;
+                "exit"|"reboot")
+                    log_info "Emergency shutdown requested"
+                    cleanup_and_shutdown
+                    ;;
+                *)
+                    echo "Unknown command: $cmd"
+                    ;;
+            esac
+        done
+    fi
+}
+
+# Recovery mode check
+if grep -q "recovery" /proc/cmdline 2>/dev/null; then
+    log_warning "Recovery mode detected"
+    echo "Solix Recovery Mode"
+    echo "Type 'exit' to continue normal boot"
+    /bin/bash || /bin/sh
+fi
+
+# Execute main initialization
+main
+
+# This should not be reached
+log_error "Init script ended unexpectedly!"
+sleep 5
+exec /bin/sh 

@@ -1,0 +1,13 @@
+.git
+out
+build
+kernel/downloads
+busybox/downloads
+*.iso
+*.img
+*.o
+*.tar.*
+*.cpio.gz
+__pycache__
+node_modules
+

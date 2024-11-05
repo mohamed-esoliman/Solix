@@ -1,0 +1,8 @@
+build/
+out/
+*.iso
+*.img
+kernel/downloads/
+busybox/downloads/
+iso/iso-staging/
+

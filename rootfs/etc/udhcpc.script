@@ -1,0 +1,19 @@
+#!/bin/sh
+# Minimal udhcpc script to configure interface
+case "$1" in
+  deconfig)
+    ip addr flush dev "$interface" || true
+    ;;
+  bound|renew)
+    ip addr flush dev "$interface" || true
+    ip addr add "$ip"/${subnet:-24} dev "$interface"
+    [ -n "$router" ] && ip route add default via "$router" dev "$interface" || true
+    if [ -n "$dns" ]; then
+      : > /etc/resolv.conf
+      for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done
+    fi
+    ;;
+esac
+exit 0
+
+

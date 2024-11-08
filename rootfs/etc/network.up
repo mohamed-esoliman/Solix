@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+# Bring up eth0 via udhcpc if present; log to /var/log/net.log
+
+LOG_FILE="/var/log/net.log"
+mkdir -p /var/log || true
+
+if [ -d /sys/class/net/eth0 ]; then
+    echo "[net] eth0 detected" | tee -a "$LOG_FILE"
+    if command -v udhcpc >/dev/null 2>&1; then
+        echo "[net] starting udhcpc on eth0" | tee -a "$LOG_FILE"
+        udhcpc -i eth0 -t 5 -n >/dev/null 2>&1 || true
+        ip addr show dev eth0 2>/dev/null | tee -a "$LOG_FILE" || true
+    else
+        echo "[net] udhcpc not found" | tee -a "$LOG_FILE"
+    fi
+else
+    echo "[net] no eth0 present" | tee -a "$LOG_FILE"
+fi
+
+

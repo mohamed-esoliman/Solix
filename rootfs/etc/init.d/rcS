@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 #
 # Solix Init System (rcS)
 # Part of the Solix custom Linux build
@@ -24,29 +24,28 @@ Solix Custom Linux System
 Version 1.0 - Handcrafted from scratch
 "
 
-# Logging setup
+# Logging setup (portable, no bashisms)
 LOG_FILE="/var/log/boot.log"
 mkdir -p /var/log
-exec 1> >(tee -a $LOG_FILE)
-exec 2> >(tee -a $LOG_FILE >&2)
 
 log_info() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $1" | tee -a $LOG_FILE
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $1" | tee -a "$LOG_FILE"
 }
 
 log_success() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] $1" | tee -a $LOG_FILE
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] $1" | tee -a "$LOG_FILE"
 }
 
 log_error() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" | tee -a $LOG_FILE
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" | tee -a "$LOG_FILE"
 }
 
 log_warning() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] $1" | tee -a $LOG_FILE
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] $1" | tee -a "$LOG_FILE"
 }
 
 # Start of init process
+echo "[solix] rcS starting" | tee -a "$LOG_FILE"
 log_info "===== Solix Init System Starting ====="
 log_info "PID: $$"
 log_info "Init script: $0"
@@ -75,6 +74,12 @@ mount_virtual_filesystems() {
         mount -t devtmpfs devtmpfs /dev && log_success "/dev mounted" || log_error "Failed to mount /dev"
     else
         log_info "/dev already mounted"
+    fi
+
+    # Mount devpts for pty/getty
+    if [ ! -d /dev/pts ]; then mkdir -p /dev/pts; fi
+    if ! mountpoint -q /dev/pts; then
+        mount -t devpts devpts /dev/pts 2>/dev/null || true
     fi
     
     # Mount /tmp as tmpfs
@@ -159,20 +164,25 @@ setup_network() {
         return
     fi
     
-    # Try to configure eth0 with DHCP if available
-    if [ -e /sys/class/net/eth0 ]; then
-        log_info "Ethernet interface eth0 detected"
-        if command -v dhclient >/dev/null 2>&1; then
-            dhclient eth0 &
-            log_info "DHCP client started for eth0"
-        elif command -v udhcpc >/dev/null 2>&1; then
-            udhcpc -i eth0 &
-            log_info "udhcpc started for eth0"
-        else
-            log_warning "No DHCP client found"
-        fi
+    # Optional external network script
+    if [ -x /etc/network.up ]; then
+        /etc/network.up || log_warning "network.up failed"
     else
-        log_info "No ethernet interface found"
+        # Try to configure eth0 with DHCP if available
+        if [ -e /sys/class/net/eth0 ]; then
+            log_info "Ethernet interface eth0 detected"
+            if command -v udhcpc >/dev/null 2>&1; then
+                udhcpc -i eth0 -t 5 -n &
+                log_info "udhcpc started for eth0"
+            elif command -v dhclient >/dev/null 2>&1; then
+                dhclient eth0 &
+                log_info "dhclient started for eth0"
+            else
+                log_warning "No DHCP client found"
+            fi
+        else
+            log_info "No ethernet interface found"
+        fi
     fi
     
     log_success "Network setup completed"
@@ -303,11 +313,78 @@ main() {
     fi
     
     log_success "Solix initialization completed successfully!"
-    log_info "===== Init process complete, starting shell ====="
+
+    # Persistent rootfs switch_root flow
+    NEWROOT="/newroot"
+    mkdir -p "$NEWROOT"
+
+    detect_persistent_dev() {
+        for d in /dev/vda /dev/sda /dev/hda; do
+            [ -b "$d" ] && echo "$d" && return 0
+        done
+        return 1
+    }
+
+    DEV="$(detect_persistent_dev || true)"
+    if [ -n "$DEV" ]; then
+        log_info "Detected persistent block device: $DEV"
+        # Create filesystem if needed (check for valid superblock)
+        if ! blkid "$DEV" >/dev/null 2>&1; then
+            log_warning "No filesystem on $DEV; creating ext4"
+            mkfs.ext4 -F "$DEV" || log_error "mkfs.ext4 failed"
+        fi
+        # Mount and bootstrap skeleton if empty
+        if mount -t ext4 "$DEV" "$NEWROOT"; then
+            if [ ! -d "$NEWROOT/etc" ]; then
+                log_info "Bootstrapping minimal filesystem on $DEV"
+                mkdir -p "$NEWROOT"/{bin,sbin,etc,proc,sys,dev,run,tmp,usr/bin,usr/sbin,root,home,var/log}
+                echo solix >"$NEWROOT/etc/hostname"
+                echo '127.0.0.1   localhost solix' >"$NEWROOT/etc/hosts"
+                echo '::1         localhost solix' >>"$NEWROOT/etc/hosts"
+                # If BusyBox present in initramfs, install to target to provide /sbin/init
+                if [ -x /bin/busybox ]; then
+                    cp -a /bin/busybox "$NEWROOT/bin/busybox"
+                    chroot "$NEWROOT" /bin/busybox --install -s /
+                    ln -sf /bin/busybox "$NEWROOT/bin/sh"
+                fi
+                # Inittab for BusyBox init
+                cat >"$NEWROOT/etc/inittab" <<'EOF'
+::sysinit:/etc/init.d/rcS
+ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100
+tty1::respawn:/sbin/getty tty1 9600
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r
+EOF
+                # demo root user
+                echo 'root::0:0:root:/root:/bin/sh' >"$NEWROOT/etc/passwd"
+                echo 'root::19700:0:99999:7:::' >"$NEWROOT/etc/shadow"
+                chmod 600 "$NEWROOT/etc/shadow"
+            fi
+            # Bind mounts for handoff
+            for d in dev proc sys run; do
+                mount --bind "/$d" "$NEWROOT/$d" || true
+            done
+            if [ -x "$NEWROOT/sbin/init" ]; then
+                log_info "[solix] switching to persistent root via switch_root"
+                exec switch_root "$NEWROOT" /sbin/init
+            elif [ -x "$NEWROOT/etc/init.d/rcS" ]; then
+                log_info "[solix] switching to persistent root via rcS"
+                exec switch_root "$NEWROOT" /etc/init.d/rcS
+            fi
+            log_warning "switch_root path not found on newroot; continuing in initramfs"
+            umount "$NEWROOT" || true
+        else
+            log_warning "Failed to mount $DEV as ext4"
+        fi
+    else
+        log_info "No persistent device found; staying on initramfs"
+    fi
+
+    log_info "===== Init process complete, launching shell ====="
     
     # Start the main shell
     if [ -x /bin/shell ]; then
-        log_info "Starting Solix custom shell"
+        log_info "[solix] launching custom shell"
         exec /bin/shell
     elif [ -x /bin/bash ]; then
         log_warning "Custom shell not found, falling back to bash"

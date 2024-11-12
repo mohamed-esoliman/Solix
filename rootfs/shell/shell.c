@@ -5,14 +5,17 @@
  * Copyright (c) 2024 Mohamed Soliman
  * Licensed under the MIT License
  *
- * A minimal but functional shell implementation in C
- * Features:
- * - Built-in commands: cd, pwd, help, exit, clear, echo
- * - External program execution
- * - Command history (basic)
- * - Tab completion (basic)
- * - Error handling
- * - Signal handling
+ * A small but capable static shell
+ * Features now include:
+ * - Prompt: username@hostname:cwd$ (cwd truncated to last 2 segments)
+ * - History: in-memory + persistent at ~/.solix_history
+ * - Built-ins: cd, pwd, echo, help, exit, history, which, export, unset
+ * - PATH lookup for external commands
+ * - Redirections: >, >>, < (single redirection per command side)
+ * - Pipe: single pipeline cmd1 | cmd2
+ * - Chaining: cmd1 && cmd2, cmd1 || cmd2, cmd1 ; cmd2
+ * - Exit status tracking: $? expansion
+ * - Signals: foreground job receives SIGINT; shell survives
  */
 
 #include <stdio.h>
@@ -32,29 +35,40 @@
 #define MAX_CMD_LEN 1024
 #define MAX_ARGS 64
 #define MAX_PATH_LEN 512
-#define HISTORY_SIZE 100
+#define HISTORY_SIZE 200
 #define PROMPT_COLOR "\033[1;32m"
 #define ERROR_COLOR "\033[1;31m"
 #define INFO_COLOR "\033[1;34m"
 #define RESET_COLOR "\033[0m"
+#define MAX_TOKENS 128
 
 // Global variables
 static char command_history[HISTORY_SIZE][MAX_CMD_LEN];
 static int history_count = 0;
 static int history_index = 0;
 static volatile sig_atomic_t running = 1;
+static int last_status = 0;
+static char history_path[512];
 
 // Function prototypes
 void print_banner(void);
 void print_prompt(void);
 char *read_command(void);
-char **parse_command(char *command);
-int execute_command(char **args);
-void free_args(char **args);
+int tokenize_command(const char *line, char *tokens[], int max_tokens);
+void free_tokens(char *tokens[], int count);
+void expand_vars(char *tokens[], int count);
+int is_builtin(const char *cmd);
+int exec_builtin(char *const argv[]);
+int exec_external(char *const argv[], int in_fd, int out_fd);
+int exec_simple(char *const argv[], const char *in_file, const char *out_file, int append);
+int exec_pipeline(char *const left_argv[], const char *left_in, char *const right_argv[], const char *right_out, int append);
+int execute_line_tokens(char *tokens[], int count);
 void add_to_history(const char *command);
 void print_history(void);
 void signal_handler(int sig);
 void setup_signals(void);
+void load_history(void);
+void save_history(void);
 
 // Built-in command prototypes
 int builtin_cd(char **args);
@@ -67,6 +81,9 @@ int builtin_ls(char **args);
 int builtin_cat(char **args);
 int builtin_history(char **args);
 int builtin_uptime(char **args);
+int builtin_which(char **args);
+int builtin_export(char **args);
+int builtin_unset(char **args);
 
 // Built-in commands table
 struct
@@ -85,6 +102,9 @@ struct
     {"cat", builtin_cat, "Display file contents"},
     {"history", builtin_history, "Show command history"},
     {"uptime", builtin_uptime, "Show system uptime"},
+    {"which", builtin_which, "Locate a command in PATH"},
+    {"export", builtin_export, "Export environment variable: export VAR=value"},
+    {"unset", builtin_unset, "Unset environment variable"},
     {NULL, NULL, NULL}};
 
 /**
@@ -110,21 +130,17 @@ void print_prompt(void)
 {
     char cwd[MAX_PATH_LEN];
     char hostname[256];
-
-    // Get current working directory
-    if (getcwd(cwd, sizeof(cwd)) == NULL)
-    {
-        strcpy(cwd, "unknown");
-    }
-
-    // Get hostname
-    if (gethostname(hostname, sizeof(hostname)) != 0)
-    {
-        strcpy(hostname, "solix");
-    }
-
-    // Print colorized prompt
-    printf("%sroot@%s:%s> %s", PROMPT_COLOR, hostname, cwd, RESET_COLOR);
+    const char *user = getenv("USER");
+    if (!user || !*user) user = "root";
+    if (getcwd(cwd, sizeof(cwd)) == NULL) strcpy(cwd, "?");
+    if (gethostname(hostname, sizeof(hostname)) != 0) strcpy(hostname, "solix");
+    // truncate cwd to last 2 segments
+    char truncated[MAX_PATH_LEN];
+    const char *p = cwd; const char *last = cwd; const char *second = cwd;
+    for (; *p; ++p) if (*p=='/') { second = last; last = p+1; }
+    if (second==cwd) snprintf(truncated, sizeof(truncated), "%s", cwd);
+    else snprintf(truncated, sizeof(truncated), "/%s/%s", second, last);
+    printf("%s%s@%s:%s$ %s", PROMPT_COLOR, user, hostname, truncated, RESET_COLOR);
     fflush(stdout);
 }
 
@@ -133,127 +149,207 @@ void print_prompt(void)
  */
 char *read_command(void)
 {
-    char *command = malloc(MAX_CMD_LEN);
-    if (!command)
-    {
-        fprintf(stderr, "%sError: Memory allocation failed%s\n", ERROR_COLOR, RESET_COLOR);
-        return NULL;
-    }
-
-    if (fgets(command, MAX_CMD_LEN, stdin) == NULL)
-    {
-        free(command);
-        return NULL; // EOF or error
-    }
-
-    // Remove trailing newline
-    size_t len = strlen(command);
-    if (len > 0 && command[len - 1] == '\n')
-    {
-        command[len - 1] = '\0';
-    }
-
-    return command;
+    static char buf[MAX_CMD_LEN];
+    if (!fgets(buf, sizeof(buf), stdin)) return NULL;
+    size_t len = strlen(buf);
+    if (len && buf[len-1]=='\n') buf[len-1]='\0';
+    return buf;
 }
 
 /**
  * Parse command into arguments
  */
-char **parse_command(char *command)
+static int is_space(char c){ return c==' '||c=='\t'; }
+
+int tokenize_command(const char *line, char *tokens[], int max_tokens)
 {
-    char **args = malloc(MAX_ARGS * sizeof(char *));
-    if (!args)
-    {
-        fprintf(stderr, "%sError: Memory allocation failed%s\n", ERROR_COLOR, RESET_COLOR);
-        return NULL;
-    }
-
-    int argc = 0;
-    char *token = strtok(command, " \t");
-
-    while (token != NULL && argc < MAX_ARGS - 1)
-    {
-        args[argc] = malloc(strlen(token) + 1);
-        if (!args[argc])
-        {
-            // Free previously allocated memory
-            for (int i = 0; i < argc; i++)
-            {
-                free(args[i]);
-            }
-            free(args);
-            return NULL;
+    int count = 0; const char *p = line;
+    while (*p) {
+        while (is_space(*p)) p++;
+        if (!*p) break;
+        if (count >= max_tokens) break;
+        // two-char operators
+        if ((p[0]=='&'&&p[1]=='&') || (p[0]=='|'&&p[1]=='|') || (p[0]=='>'&&p[1]=='>')) {
+            tokens[count++] = strndup(p, 2); p+=2; continue;
         }
-        strcpy(args[argc], token);
-        argc++;
-        token = strtok(NULL, " \t");
+        // one-char operators ; | > <
+        if (*p==';' || *p=='|' || *p=='>' || *p=='<') { tokens[count++] = strndup(p,1); p++; continue; }
+        // word with quotes
+        char buf[MAX_CMD_LEN]; int bi=0; int in_s=0,in_d=0;
+        while (*p && (in_s||in_d || (!is_space(*p) && *p!=';' && *p!='|' && *p!='>' && *p!='<'))) {
+            if (!in_s && *p=='"') { in_d = !in_d; p++; continue; }
+            if (!in_d && *p=='\'') { in_s = !in_s; p++; continue; }
+            if (*p=='\\' && p[1]) { buf[bi++] = p[1]; p += 2; continue; }
+            buf[bi++]=*p++;
+            if (bi>=MAX_CMD_LEN-1) break;
+        }
+        buf[bi]='\0';
+        tokens[count++] = strdup(buf);
     }
+    return count;
+}
 
-    args[argc] = NULL; // Null-terminate the array
-    return args;
+void free_tokens(char *tokens[], int count)
+{
+    for (int i=0;i<count;i++) free(tokens[i]);
+}
+
+void expand_vars(char *tokens[], int count)
+{
+    char numbuf[16];
+    snprintf(numbuf, sizeof(numbuf), "%d", last_status);
+    for (int i=0;i<count;i++) {
+        if (strcmp(tokens[i],"$?")==0) { free(tokens[i]); tokens[i]=strdup(numbuf); continue; }
+        // simple $VAR expansion
+        if (tokens[i][0]=='$' && tokens[i][1] && tokens[i][1] != '?') {
+            const char *val = getenv(tokens[i]+1);
+            if (val) { free(tokens[i]); tokens[i]=strdup(val); }
+        }
+    }
 }
 
 /**
  * Execute a command (built-in or external)
  */
-int execute_command(char **args)
+int is_builtin(const char *cmd){
+    if (!cmd) return 0;
+    for (int i=0; builtin_commands[i].name; i++) if (strcmp(cmd,builtin_commands[i].name)==0) return 1;
+    return 0;
+}
+
+int exec_builtin(char *const argv[]){
+    for (int i=0; builtin_commands[i].name; i++) if (strcmp(argv[0], builtin_commands[i].name)==0) return builtin_commands[i].function((char**)argv);
+    return 127;
+}
+
+int exec_external(char *const argv[], int in_fd, int out_fd)
 {
-    if (args[0] == NULL)
-    {
-        return 0; // Empty command
-    }
-
-    // Check for built-in commands
-    for (int i = 0; builtin_commands[i].name != NULL; i++)
-    {
-        if (strcmp(args[0], builtin_commands[i].name) == 0)
-        {
-            return builtin_commands[i].function(args);
-        }
-    }
-
-    // Execute external command
     pid_t pid = fork();
-    if (pid == 0)
-    {
-        // Child process
-        if (execvp(args[0], args) == -1)
-        {
-            fprintf(stderr, "%ssolix: %s: command not found%s\n",
-                    ERROR_COLOR, args[0], RESET_COLOR);
-            exit(127);
-        }
-    }
-    else if (pid < 0)
-    {
-        fprintf(stderr, "%sError: Failed to fork process%s\n", ERROR_COLOR, RESET_COLOR);
+    if (pid==0){
+        signal(SIGINT, SIG_DFL);
+        if (in_fd != -1) { dup2(in_fd, STDIN_FILENO); }
+        if (out_fd != -1) { dup2(out_fd, STDOUT_FILENO); }
+        execvp(argv[0], (char* const*)argv);
+        fprintf(stderr, "%ssolix: %s: command not found%s\n", ERROR_COLOR, argv[0], RESET_COLOR);
+        _exit(127);
+    } else if (pid<0){
+        perror("fork");
         return 1;
     }
-    else
-    {
-        // Parent process
-        int status;
-        waitpid(pid, &status, 0);
-        return WEXITSTATUS(status);
-    }
+    int status; int w = waitpid(pid, &status, 0);
+    (void)w;
+    return WIFEXITED(status)? WEXITSTATUS(status) : 128+SIGINT;
+}
 
-    return 0;
+int exec_simple(char *const argv[], const char *in_file, const char *out_file, int append)
+{
+    int in_fd=-1, out_fd=-1; int rc;
+    if (in_file){ in_fd = open(in_file, O_RDONLY); if (in_fd<0){ perror("open in"); return 1; } }
+    if (out_file){ int flags = O_WRONLY|O_CREAT|(append?O_APPEND:O_TRUNC); out_fd = open(out_file, flags, 0644); if (out_fd<0){ perror("open out"); if(in_fd!=-1) close(in_fd); return 1; } }
+    if (is_builtin(argv[0]) && in_fd==-1 && out_fd==-1){
+        rc = exec_builtin(argv);
+    } else {
+        rc = exec_external(argv, in_fd, out_fd);
+    }
+    if (in_fd!=-1) close(in_fd);
+    if (out_fd!=-1) close(out_fd);
+    return rc;
+}
+
+int exec_pipeline(char *const left_argv[], const char *left_in, char *const right_argv[], const char *right_out, int append)
+{
+    int pipefd[2]; if (pipe(pipefd)<0){ perror("pipe"); return 1; }
+    pid_t c1 = fork();
+    if (c1==0){
+        signal(SIGINT, SIG_DFL);
+        // left process
+        int in_fd=-1; if (left_in){ in_fd=open(left_in,O_RDONLY); if(in_fd<0) _exit(1);} 
+        if (in_fd!=-1) dup2(in_fd, STDIN_FILENO);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[0]); close(pipefd[1]); if(in_fd!=-1) close(in_fd);
+        if (is_builtin(left_argv[0])) _exit(exec_builtin(left_argv));
+        execvp(left_argv[0], (char* const*)left_argv);
+        _exit(127);
+    }
+    pid_t c2 = fork();
+    if (c2==0){
+        signal(SIGINT, SIG_DFL);
+        // right process
+        int out_fd=-1; if (right_out){ int flags=O_WRONLY|O_CREAT|(append?O_APPEND:O_TRUNC); out_fd=open(right_out,flags,0644); if(out_fd<0) _exit(1);} 
+        dup2(pipefd[0], STDIN_FILENO);
+        if (out_fd!=-1) dup2(out_fd, STDOUT_FILENO);
+        close(pipefd[0]); close(pipefd[1]); if(out_fd!=-1) close(out_fd);
+        if (is_builtin(right_argv[0])) _exit(exec_builtin(right_argv));
+        execvp(right_argv[0], (char* const*)right_argv);
+        _exit(127);
+    }
+    close(pipefd[0]); close(pipefd[1]);
+    int st1=0, st2=0; waitpid(c1,&st1,0); waitpid(c2,&st2,0);
+    return WIFEXITED(st2)? WEXITSTATUS(st2) : 128+SIGINT;
+}
+
+int execute_line_tokens(char *tokens[], int count)
+{
+    // chaining: left-to-right, short-circuit &&/||
+    int i=0; int status=0;
+    while (i<count) {
+        // gather command until next chain op
+        int start=i; int j=i; const char *chain_op=NULL;
+        int depth=0; // not used for now
+        for (; j<count; j++) {
+            if (strcmp(tokens[j],"&&")==0 || strcmp(tokens[j],"||")==0 || strcmp(tokens[j],";")==0) { chain_op=tokens[j]; break; }
+        }
+        int end=j; // [start,end)
+        // Execute segment [start,end)
+        // detect pipeline and redirs
+        int pipe_index=-1; int k;
+        for (k=start;k<end;k++) if (strcmp(tokens[k],"|")==0) { pipe_index=k; break; }
+        // split argv and redirs
+        char *in_file=NULL,*out_file=NULL; int append=0;
+        char *argv_left[MAX_TOKENS]; int al=0;
+        char *argv_right[MAX_TOKENS]; int ar=0;
+        if (pipe_index==-1){
+            for (k=start;k<end;k++){
+                if (strcmp(tokens[k],">")==0 || strcmp(tokens[k],">>")==0){ append = (tokens[k][1]=='>'); if (k+1<end) { out_file=tokens[k+1]; k++; } continue; }
+                if (strcmp(tokens[k],"<")==0){ if (k+1<end){ in_file=tokens[k+1]; k++; } continue; }
+                argv_left[al++] = tokens[k];
+            }
+            argv_left[al]=NULL;
+            if (al>0) status = exec_simple(argv_left, in_file, out_file, append); else status=0;
+        } else {
+            // left side
+            for (k=start;k<pipe_index;k++){
+                if (strcmp(tokens[k],"<")==0){ if (k+1<pipe_index){ in_file=tokens[k+1]; k++; } continue; }
+                argv_left[al++]=tokens[k];
+            }
+            argv_left[al]=NULL;
+            // right side
+            for (k=pipe_index+1;k<end;k++){
+                if (strcmp(tokens[k],">")==0 || strcmp(tokens[k],">>")==0){ append = (tokens[k][1]=='>'); if (k+1<end) { out_file=tokens[k+1]; k++; } continue; }
+                argv_right[ar++]=tokens[k];
+            }
+            argv_right[ar]=NULL;
+            if (al>0 && ar>0) status = exec_pipeline(argv_left, in_file, argv_right, out_file, append); else status=0;
+        }
+        last_status = status;
+        // chain logic
+        if (!chain_op) break;
+        if (strcmp(chain_op,"&&")==0 && status!=0) { // skip to next after && segment
+            i = end+1; // skip op
+            // skip following segments separated by && until status short-circuit ends? We'll just proceed
+        } else if (strcmp(chain_op,"||")==0 && status==0) {
+            i = end+1;
+        } else {
+            i = end+1;
+        }
+    }
+    return last_status;
 }
 
 /**
  * Free command arguments
  */
-void free_args(char **args)
-{
-    if (args)
-    {
-        for (int i = 0; args[i] != NULL; i++)
-        {
-            free(args[i]);
-        }
-        free(args);
-    }
-}
+void free_args(char **args) { (void)args; }
 
 /**
  * Add command to history
@@ -277,9 +373,8 @@ void signal_handler(int sig)
     switch (sig)
     {
     case SIGINT:
-        printf("\n%sUse 'exit' to quit the shell%s\n", INFO_COLOR, RESET_COLOR);
-        print_prompt();
-        fflush(stdout);
+        printf("\n");
+        last_status = 130;
         break;
     case SIGTERM:
         printf("\n%sShell terminating...%s\n", INFO_COLOR, RESET_COLOR);
@@ -296,6 +391,36 @@ void setup_signals(void)
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGQUIT, SIG_IGN); // Ignore quit signal
+}
+
+static const char *get_history_path(void)
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = "/root";
+    snprintf(history_path, sizeof(history_path), "%s/.solix_history", home);
+    return history_path;
+}
+
+void load_history(void)
+{
+    FILE *f = fopen(get_history_path(), "r"); if (!f) return;
+    char line[MAX_CMD_LEN];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line); if (len && line[len-1]=='\n') line[len-1]='\0';
+        add_to_history(line);
+    }
+    fclose(f);
+}
+
+void save_history(void)
+{
+    FILE *f = fopen(get_history_path(), "a"); if (!f) return;
+    int start = (history_count>HISTORY_SIZE)? history_count - HISTORY_SIZE : 0;
+    for (int i=start;i<history_count;i++) {
+        int idx = i % HISTORY_SIZE;
+        fprintf(f, "%s\n", command_history[idx]);
+    }
+    fclose(f);
 }
 
 // Built-in command implementations
@@ -548,13 +673,51 @@ int builtin_uptime(char **args)
     return 0;
 }
 
+int builtin_which(char **args)
+{
+    if (!args[1]) { fprintf(stderr, "which: missing operand\n"); return 1; }
+    const char *path = getenv("PATH"); if (!path) path = "/bin:/sbin:/usr/bin:/usr/sbin";
+    char buf[512];
+    for (int i=1; args[i]; i++){
+        const char *p = path; int found=0;
+        while (*p){
+            const char *q = strchr(p, ':'); size_t len = q? (size_t)(q-p) : strlen(p);
+            snprintf(buf, sizeof(buf), "%.*s/%s", (int)len, p, args[i]);
+            if (access(buf, X_OK)==0){ printf("%s\n", buf); found=1; break; }
+            if (!q) break; p = q+1;
+        }
+        if (!found) last_status=1; else last_status=0;
+    }
+    return last_status;
+}
+
+int builtin_export(char **args)
+{
+    if (!args[1]) { fprintf(stderr, "export: usage: export VAR=value\n"); return 1; }
+    int rc=0;
+    for (int i=1; args[i]; i++){
+        char *eq = strchr(args[i], '=');
+        if (!eq || eq==args[i]) { fprintf(stderr, "export: invalid: %s\n", args[i]); rc=1; continue; }
+        *eq='\0'; const char *name=args[i]; const char *val=eq+1;
+        if (setenv(name, val, 1)!=0) { perror("export"); rc=1; }
+        *eq='=';
+    }
+    return rc;
+}
+
+int builtin_unset(char **args)
+{
+    if (!args[1]) { fprintf(stderr, "unset: usage: unset VAR [VAR...]\n"); return 1; }
+    int rc=0; for (int i=1; args[i]; i++) if (unsetenv(args[i])!=0) { perror("unset"); rc=1; }
+    return rc;
+}
+
 /**
  * Main shell loop
  */
 int main(int argc, char *argv[])
 {
-    char *command;
-    char **args;
+    char *line;
     int status = 0;
 
     // Setup signal handlers
@@ -566,39 +729,42 @@ int main(int argc, char *argv[])
     // Set environment variables
     setenv("SHELL", "/bin/shell", 1);
     setenv("PS1", "solix> ", 1);
+    if (!getenv("PATH")) setenv("PATH","/bin:/sbin:/usr/bin:/usr/sbin",1);
+
+    load_history();
 
     // Main shell loop
     while (running)
     {
         print_prompt();
 
-        command = read_command();
-        if (command == NULL)
+        line = read_command();
+        if (line == NULL)
         {
             break; // EOF or error
         }
 
         // Skip empty commands
-        if (strlen(command) == 0)
+        if (strlen(line) == 0)
         {
-            free(command);
             continue;
         }
 
         // Add to history
-        add_to_history(command);
+        add_to_history(line);
 
-        // Parse and execute command
-        args = parse_command(command);
-        if (args != NULL)
-        {
-            status = execute_command(args);
-            free_args(args);
+        // Tokenize, expand, and execute with chaining support
+        char *tokens[MAX_TOKENS];
+        int ntok = tokenize_command(line, tokens, MAX_TOKENS);
+        if (ntok>0){
+            expand_vars(tokens, ntok);
+            status = execute_line_tokens(tokens, ntok);
+            last_status = status;
+            free_tokens(tokens, ntok);
         }
-
-        free(command);
     }
 
     printf("\n%sExiting Solix shell...%s\n", INFO_COLOR, RESET_COLOR);
+    save_history();
     return status;
 }

@@ -2,179 +2,129 @@
 
 > **Solix** = **Sol**iman + L**inux** (because why not name your OS after yourself?)
 
-**Solix** is a minimalist Linux-based operating system built entirely from source code, following Linux From Scratch (LFS) principles. Every component is compiled and configured manually:
 
-- **Custom Toolchain**: Binutils, GCC, and Glibc compiled from source
-- **Linux Kernel**: Configured and compiled for minimal hardware support
-- **Custom Init System**: Bash-based initialization
-- **Custom Shell**: A minimal C-based shell with basic command support
-- **GRUB Bootloader**: Configured for automatic system boot
-- **Live ISO**: Bootable image for virtual machines
+This repository builds a small, bootable Linux system using:
+
+- **Linux Kernel 6.6.8** (real bzImage)
+- **BusyBox (static)** as minimal userland and `/bin/sh`
+- **Custom Init** script at `rootfs/etc/init.d/rcS` (supports switch_root to persistent ext4)
+- **Custom C Shell** compiled statically and included in initramfs (now with history, redirs, pipes, which, export/unset)
+- **GRUB ISO** for CD/VM boot, plus QEMU run with kernel+initramfs
 
 ## Features
 
-- Manual toolchain build with complete GCC cross-compilation environment
-- Linux Kernel 6.6.x with minimal configuration
-- Custom init system with lightweight bash-based startup process
-- Interactive shell with `cd`, `ls`, `exit`, and program execution capabilities
-- GRUB2 bootloader with automated boot configuration
-- Live ISO generation for testing and demonstration
-- Comprehensive boot logging and virtual filesystem support
+- Real upstream Linux kernel 6.6.8 (bzImage)
+- Minimal kernel config enabling initramfs, devtmpfs (auto-mount), serial console
+- Static BusyBox userland providing `/bin/sh` and core applets
+- Custom init (`rootfs/etc/init.d/rcS`) as PID1 handoff via `/init` with optional `switch_root` to ext4
+- BusyBox init with `/etc/inittab` spawning getty on `ttyS0` and `tty1` when persistent root is in use
+- Optional DHCP on `eth0` via `udhcpc` (`/etc/network.up`)
+- Custom static C shell included in initramfs and installed into persistent root
+- GRUB ISO build for VM boot, plus direct QEMU boot (kernel+initramfs)
+- Simple, reproducible build via Docker
+- Boot logs to `/var/log/boot.log` in initramfs
 
 ## System Requirements
 
-### Host System
+- Recommended: Docker (Linux/macOS host), x86_64 CPU, 8GB RAM, ~10GB free disk
+- Optional (host build without Docker): gcc/make, kernel build deps, `grub-mkrescue`, `xorriso`, `qemu`
 
-- **OS**: Linux (Ubuntu 20.04+, Debian 11+, or equivalent)
-- **Architecture**: x86_64
-- **RAM**: 4GB minimum, 8GB recommended
-- **Disk Space**: 10GB free space
-- **Privileges**: sudo access required
-
-### Required Packages
-
-Ubuntu/Debian:
+## Quick Start (Docker recommended)
 
 ```bash
-sudo apt update && sudo apt install -y \
-    build-essential bison flex texinfo \
-    gawk wget tar xz-utils cpio grub-pc-bin \
-    grub-efi-amd64-bin xorriso mtools
-```
-
-RedHat/CentOS/Fedora:
-
-```bash
-sudo dnf groupinstall "Development Tools" && \
-sudo dnf install bison flex texinfo gawk wget \
-    tar xz cpio grub2-pc grub2-efi-x64 \
-    xorriso mtools
-```
-
-## Quick Start
-
-```bash
-# Clone the project
+# Clone
 git clone <repository-url> solix
 cd solix
 
-# Build the complete system
-make all
+# Build container
+docker build -t solix-build .
 
-# Test in QEMU
-make test
+# Build everything inside container (bind mount your repo)
+docker run --rm -it -v "$PWD":/workspace -w /workspace solix-build bash -lc "make all"
 
-# Clean build artifacts
-make clean
+# Run with QEMU from the container or host (initramfs only)
+docker run --rm -it --device /dev/kvm -v "$PWD":/workspace -w /workspace solix-build bash -lc "make run" || \
+qemu-system-x86_64 -kernel build/boot/vmlinuz -initrd build/initramfs.img -m 512M -nographic -serial mon:stdio -append "console=ttyS0 quiet"
+
+# Persistent rootfs image and run
+make rootfsimg && make run-persistent
 ```
 
 ## Build Process
 
-### Automated Build
+### Make targets
 
 ```bash
-make all
+make all        # kernel + busybox + custom shell + initramfs + ISO -> out/solix-1.0.iso
+make kernel     # download and build Linux 6.6.8 bzImage
+make busybox    # build static BusyBox, install to busybox/_install
+make shell      # compile rootfs/shell/shell.c statically into build/rootfs/bin/shell
+make initramfs  # build build/initramfs.img with /init, rcS, BusyBox, and custom shell
+make iso        # produce out/solix-1.0.iso with GRUB
+make run        # boot with QEMU using kernel+initramfs
+make rootfsimg  # builds build/rootfs.img ext4 and populates it
+make run-persistent  # boot kernel+initramfs with rootfs.img attached as virtio disk
+make utils      # build static utilities
+make test       # smoke boot up to 20s; grep for key boot log lines
 ```
 
-### Manual Build Steps
+### Boot Flow
 
-1. **Build Toolchain**
-
-```bash
-cd toolchain
-./build-binutils.sh
-./build-gcc.sh
-./build-glibc.sh
+```
+GRUB/QEMU -> kernel -> initramfs /init -> rcS -> (optional) switch_root to ext4 -> BusyBox init/getty -> login or shell
 ```
 
-2. **Compile Kernel**
+### Shell capabilities
 
-```bash
-cd kernel
-./build-kernel.sh
-```
+- Prompt: username@hostname:cwd$
+- History: in-memory + persistent at ~/.solix_history
+- Built-ins: cd, pwd, echo, help, exit, history, which, export, unset
+- External exec via PATH lookup
+- Redirections: >, >>, <
+- Pipe: single pipeline cmd1 | cmd2
+- Chaining: cmd1 && cmd2, cmd1 || cmd2, cmd1 ; cmd2
+- Exit status: $? expansion
 
-3. **Build Custom Shell**
+### Try these
 
-```bash
-cd rootfs/shell
-gcc -o ../bin/shell shell.c
-```
+- uptime_lite, ps_lite, meminfo_lite
+- ifconfig/udhcpc (if present)
 
-4. **Configure Bootloader**
+Note: root login is passwordless for demo only. Do not use in production.
 
-```bash
-cd grub
-./build-grub.sh
-```
-
-5. **Generate ISO**
-
-```bash
-cd iso
-./make-iso.sh
-```
+- First kernel build can take 20–60 minutes depending on CPU cores; subsequent runs are fast.
 
 ## Architecture
-
-### Boot Sequence
-
-1. **GRUB Bootloader** loads and starts the Linux kernel
-2. **Kernel Initialization** performs hardware detection and driver loading
-3. **Init System** executes custom `/etc/init.d/rcS` script
-4. **Virtual Filesystems** mounting of `/proc`, `/sys`, `/dev`
-5. **Shell Launch** provides user interaction
 
 ### Key Components
 
 **Custom Init System** (`/etc/init.d/rcS`)
 
-- Mounts virtual filesystems
-- Sets up basic system environment
-- Configures network interfaces
+- Mounts `/proc`, `/sys`, `/dev`
+- Sets hostname and environment
+- Optional simple network bring-up
 - Launches the custom shell
-- Logs activities to `/var/log/boot.log`
 
-**Custom Shell** (`shell.c`)
+**Custom Shell** (`rootfs/shell/shell.c`)
 
-- Interactive command prompt
-- Built-in commands: `cd`, `exit`, `help`
-- External program execution
-- Command parsing and error handling
+- Built-ins: `cd`, `pwd`, `help`, `exit`, `clear`, `echo`, `ls`, `cat`, `history`, `uptime`
+- Static binary included in initramfs
 
 ## Usage
 
 ### Testing the System
 
-**QEMU**:
+**QEMU ISO mode**:
 
 ```bash
-qemu-system-x86_64 -cdrom iso/solix.iso -m 512M
+qemu-system-x86_64 -cdrom out/solix-1.0.iso -m 512M
 ```
 
 **VirtualBox**:
 
-- Create new VM
-- Mount `iso/solix.iso` as CD/DVD
+- Create new VM (Linux x86_64)
+- Mount `out/solix-1.0.iso` as CD/DVD
 - Boot from CD/DVD
-
-### Available Commands
-
-```bash
-solix> ls           # List directory contents
-solix> cd /home     # Change directory
-solix> echo hello   # Echo text
-solix> help         # Show available commands
-solix> exit         # Shutdown system
-```
-
-## Important Notes
-
-- This project is designed for educational purposes and system demonstration
-- The system has minimal security features and hardware support
-- Optimized for virtualization environments
-- Changes are not persistent across reboots (live system)
-- Recommended for use in virtual machines only
 
 ## Contributing
 
@@ -186,7 +136,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ## References
 
-- [Linux From Scratch](http://www.linuxfromscratch.org/)
-- [The Linux Kernel Documentation](https://www.kernel.org/doc/)
-- [GNU Toolchain Documentation](https://gcc.gnu.org/onlinedocs/)
-- [GRUB Manual](https://www.gnu.org/software/grub/manual/)
+- `https://www.kernel.org/`
+- `https://busybox.net/`
+- `https://www.gnu.org/software/grub/manual/`
